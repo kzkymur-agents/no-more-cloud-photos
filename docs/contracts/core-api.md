@@ -69,7 +69,7 @@ Historical `purge_after` and processor parameters are internal/history fields, n
 |---|---|---|
 | `id` | UUID | Stable logical media ID. |
 | `mime_type` | string | Content-detected normalized original MIME. |
-| `original_filename` | string? | Sanitized metadata only; never used as a path. |
+| `original_filename` | string? | Normalized client basename as defined by the upload contract; metadata only and never used as a path. |
 | `size_bytes` | integer | Original size. |
 | `width`, `height` | integer? | Probed source dimensions. |
 | `duration_ms` | integer? | Probed source duration. |
@@ -96,7 +96,7 @@ Deleted media remains addressable by `GET /media/{id}` and the original/display/
 |---|---|---|
 | `id`, `media_id` | UUID | Original and media IDs. |
 | `mime_type`, `size_bytes`, `sha256` | string, integer, string | Content metadata. |
-| `original_filename` | string? | Upload name as sanitized metadata. |
+| `original_filename` | string? | Normalized client basename as defined by the upload contract. |
 | `file_url` | string | Immutable File Server URL. |
 | `created_at` | timestamp | Persistence time. |
 
@@ -143,7 +143,9 @@ Original EXIF is intentionally not returned by v1; it is retained in storage for
 
 ### `POST /media`
 
-Required headers are `Content-Type: multipart/form-data; boundary=...` and `Idempotency-Key`. The key is 1-128 visible ASCII characters, excluding whitespace and control characters. A request has exactly one part named `file`; other parts, nested multipart, `Content-Transfer-Encoding`, empty files, and more than one `file` are `400 invalid_multipart`. `filename` is optional, UTF-8, at most 255 bytes after normalization, and metadata only. The part's declared content type is advisory and never drives MIME selection.
+Required headers are `Content-Type: multipart/form-data; boundary=...` and `Idempotency-Key`. The key is 1-128 visible ASCII characters, excluding whitespace and control characters. A request has exactly one part named `file`; other parts, nested multipart, `Content-Transfer-Encoding`, empty files, and more than one `file` are `400 invalid_multipart`. The part's declared content type is advisory and never drives MIME selection.
+
+The optional client filename is normalized once and the resulting value is used both for `original_filename` and the idempotency request hash. RFC 8187 `filename*` takes precedence over `filename` and must declare UTF-8; invalid percent encoding, invalid UTF-8, NUL, DEL, or Unicode control characters return `400 invalid_filename`. Core converts backslashes to slashes, takes only the final non-empty path component (removing browser-supplied paths such as `C:\\fakepath\\`), and normalizes that basename to Unicode NFC. An absent or empty filename becomes JSON/database `null`; `.` and `..` are also treated as null. The normalized basename must be at most 255 UTF-8 bytes. No trimming, case folding, or character replacement is performed. It is retained only as display metadata and never enters a storage key or process argument.
 
 Core streams to a same-filesystem temporary file while computing SHA-256. It never buffers the complete upload in memory. Limits are:
 
@@ -154,7 +156,7 @@ Core streams to a same-filesystem temporary file while computing SHA-256. It nev
 - After the complete body is read, Core has 30 seconds to write the JSON response. If the connection disappears after commit, the stored idempotency result remains authoritative for retry.
 - Metadata probe after the complete temporary upload, but before final acceptance publication: 60 seconds and 1 GiB address-space limit per probe process. Decode/probe failure, malformed input, decompression-bomb policy violation, or unsupported codec returns `422 invalid_media`; unknown/unregistered content MIME returns `415 unsupported_media_type`. Malformed optional EXIF alone does not reject otherwise decodable media.
 
-The canonical idempotency request hash is SHA-256 over a versioned encoding of the file SHA-256, exact byte size, and normalized filename. Multipart boundaries and advisory MIME headers are excluded, so a correctly reconstructed retry matches.
+The canonical idempotency request hash is SHA-256 over a versioned, length-prefixed encoding of the file SHA-256, exact byte size, and normalized filename, with a distinct marker for null. Multipart boundaries, `filename` spelling before the normalization above, and advisory MIME headers are excluded, so a correctly reconstructed retry matches.
 
 On first success, the response is `201`:
 
@@ -329,7 +331,7 @@ The binary is `nmcp-admin` using Go `flag`. All commands accept `--json`; human-
 | `profile activate --id UUID [--json]` | Atomically retire the prior active version for the key and activate the draft. Never backfills media. |
 | `profile retire --id UUID [--json]` | Retire an active profile; historical targets remain valid. |
 | `regenerate --profile KEY (--media-id UUID OR --all) [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Create paged transform jobs pinned to the active profile version. `--all` requires `--yes` unless dry-run. Persisted batch state makes `--resume` safe and prevents duplicate target work. |
-| `jobs retry (--job-id UUID OR --status failed) [--type TYPE] [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Requeue the same failed job and only failed/pending targets; succeeded targets are immutable. Bulk retry requires confirmation. |
+| `jobs retry (--job-id UUID OR --status failed) [--type TYPE] [--additional-attempts N] [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Requeue the same failed job and only failed/pending targets; succeeded targets are immutable. `--additional-attempts` is a positive integer, defaults to 3, and atomically sets `max_attempts = max(max_attempts, attempts + N)` before requeue so an exhausted job is claimable without erasing its attempt history. Bulk retry requires confirmation. |
 | `check [--scope VALUE] [--json]` | `--scope` accepts `files`, `db`, or `all`. Read-only reconciliation classifies temporary, orphan, missing, checksum mismatch, and invariant violations. Never deletes. |
 | `repair --report UUID [--quarantine-dir PATH] [--dry-run] --yes [--json]` | Apply an explicit saved check report under maintenance lock. Ambiguous/orphan files are quarantined, not immediately deleted. |
 | `cleanup [--kind VALUE] [--dry-run] --yes [--json]` | `--kind` accepts `renditions`, `media`, `backups`, or `all`. Run due cleanup using the same locks/rechecks as automatic cleanup. |

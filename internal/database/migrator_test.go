@@ -58,7 +58,7 @@ func TestDiscoverMigrations(t *testing.T) {
 
 	fsys := fstest.MapFS{
 		"migrations/README.md":          {Data: []byte("documentation")},
-		"migrations/0010_add_index.sql": {Data: []byte("CREATE INDEX example;")},
+		"migrations/0010_add_index.sql": {Data: []byte(nonTransactionalDirective + "\nCREATE INDEX example;")},
 		"migrations/0002_create.sql":    {Data: []byte("CREATE TABLE example();")},
 	}
 	migrations, err := discoverMigrations(fsys, "migrations")
@@ -74,10 +74,54 @@ func TestDiscoverMigrations(t *testing.T) {
 	if migrations[0].checksum != checksumSQL(fsys["migrations/0002_create.sql"].Data) {
 		t.Fatal("discovered checksum does not match migration contents")
 	}
+	if !migrations[0].transactional || migrations[0].idempotent {
+		t.Fatal("migration without a directive should be transactional")
+	}
+	if migrations[1].transactional || !migrations[1].idempotent {
+		t.Fatal("transaction-off migration metadata was not discovered")
+	}
 
 	fsys["migrations/0002_create.sql"].Data[0] = 'X'
 	if migrations[0].sql != "CREATE TABLE example();" {
 		t.Fatal("discovered migration changed after its source filesystem was mutated")
+	}
+}
+
+func TestParseMigrationDirective(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		sql           string
+		transactional bool
+		idempotent    bool
+		wantErr       bool
+	}{
+		{name: "default", sql: "SELECT 1", transactional: true},
+		{name: "transaction off", sql: nonTransactionalDirective + "\nCREATE INDEX CONCURRENTLY example ON photos (id)", idempotent: true},
+		{name: "CRLF", sql: nonTransactionalDirective + "\r\nSELECT 1", idempotent: true},
+		{name: "missing idempotent", sql: "-- nmcp:transaction=off\nSELECT 1", wantErr: true},
+		{name: "wrong idempotent value", sql: "-- nmcp:transaction=off idempotent=false\nSELECT 1", wantErr: true},
+		{name: "extra option", sql: nonTransactionalDirective + " extra=true\nSELECT 1", wantErr: true},
+		{name: "not first line", sql: "-- explanation\n" + nonTransactionalDirective + "\nSELECT 1", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transactional, idempotent, err := parseMigrationDirective([]byte(test.sql))
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseMigrationDirective() error = %v", err)
+			}
+			if transactional != test.transactional || idempotent != test.idempotent {
+				t.Fatalf("parseMigrationDirective() = (%t, %t), want (%t, %t)", transactional, idempotent, test.transactional, test.idempotent)
+			}
+		})
 	}
 }
 
@@ -97,8 +141,8 @@ func TestValidateHistory(t *testing.T) {
 	t.Parallel()
 
 	migrations := []migration{
-		{version: 1, name: "first", checksum: "checksum-1", sql: "SELECT 1"},
-		{version: 3, name: "third", checksum: "checksum-3", sql: "SELECT 3"},
+		{version: 1, name: "first", checksum: "checksum-1", sql: "SELECT 1", transactional: true},
+		{version: 3, name: "third", checksum: "checksum-3", sql: "SELECT 3", transactional: true},
 	}
 	tests := []struct {
 		name        string
@@ -109,14 +153,14 @@ func TestValidateHistory(t *testing.T) {
 		{name: "empty", wantPending: 2},
 		{
 			name:        "valid prefix",
-			applied:     []appliedMigration{{version: 1, name: "first", checksum: "checksum-1"}},
+			applied:     []appliedMigration{{version: 1, name: "first", checksum: "checksum-1", transactional: true}},
 			wantPending: 1,
 		},
 		{
 			name: "complete",
 			applied: []appliedMigration{
-				{version: 1, name: "first", checksum: "checksum-1"},
-				{version: 3, name: "third", checksum: "checksum-3"},
+				{version: 1, name: "first", checksum: "checksum-1", transactional: true},
+				{version: 3, name: "third", checksum: "checksum-3", transactional: true},
 			},
 		},
 		{
@@ -126,18 +170,28 @@ func TestValidateHistory(t *testing.T) {
 		},
 		{
 			name:    "checksum drift",
-			applied: []appliedMigration{{version: 1, name: "first", checksum: "changed"}},
+			applied: []appliedMigration{{version: 1, name: "first", checksum: "changed", transactional: true}},
 			wantErr: ErrChecksumMismatch,
 		},
 		{
 			name:    "renamed migration",
-			applied: []appliedMigration{{version: 1, name: "renamed", checksum: "checksum-1"}},
+			applied: []appliedMigration{{version: 1, name: "renamed", checksum: "checksum-1", transactional: true}},
 			wantErr: ErrInvalidMigrationHistory,
 		},
 		{
 			name:    "non-prefix downgrade shape",
-			applied: []appliedMigration{{version: 3, name: "third", checksum: "checksum-3"}},
+			applied: []appliedMigration{{version: 3, name: "third", checksum: "checksum-3", transactional: true}},
 			wantErr: ErrInvalidMigrationHistory,
+		},
+		{
+			name:    "execution metadata drift",
+			applied: []appliedMigration{{version: 1, name: "first", checksum: "checksum-1"}},
+			wantErr: ErrInvalidMigrationHistory,
+		},
+		{
+			name:    "dirty transactional migration",
+			applied: []appliedMigration{{version: 1, name: "first", checksum: "checksum-1", transactional: true, dirty: true}},
+			wantErr: ErrDirtyMigration,
 		},
 	}
 
@@ -151,5 +205,41 @@ func TestValidateHistory(t *testing.T) {
 				t.Fatalf("len(pending) = %d, want %d", len(pending), test.wantPending)
 			}
 		})
+	}
+}
+
+func TestPlanHistoryRecoversOnlyIdempotentNonTransactionalTail(t *testing.T) {
+	t.Parallel()
+
+	migrations := []migration{
+		{version: 1, name: "first", checksum: "checksum-1", transactional: true},
+		{version: 2, name: "index", checksum: "checksum-2", idempotent: true},
+		{version: 3, name: "third", checksum: "checksum-3", transactional: true},
+	}
+	applied := []appliedMigration{
+		{version: 1, name: "first", checksum: "checksum-1", transactional: true},
+		{version: 2, name: "index", checksum: "checksum-2", idempotent: true, dirty: true},
+	}
+
+	plan, err := planHistory(migrations, applied, true)
+	if err != nil {
+		t.Fatalf("planHistory() error = %v", err)
+	}
+	if plan.dirty == nil || plan.dirty.version != 2 {
+		t.Fatalf("dirty migration = %+v, want version 2", plan.dirty)
+	}
+	if len(plan.pending) != 1 || plan.pending[0].version != 3 {
+		t.Fatalf("pending migrations = %+v, want version 3", plan.pending)
+	}
+
+	nonTail := append(applied, appliedMigration{version: 3, name: "third", checksum: "checksum-3", transactional: true})
+	if _, err := planHistory(migrations, nonTail, true); !errors.Is(err, ErrInvalidMigrationHistory) {
+		t.Fatalf("planHistory(non-tail dirty) error = %v, want ErrInvalidMigrationHistory", err)
+	}
+
+	nonIdempotent := []migration{{version: 1, name: "unsafe", checksum: "checksum", transactional: false}}
+	nonIdempotentHistory := []appliedMigration{{version: 1, name: "unsafe", checksum: "checksum", dirty: true}}
+	if _, err := planHistory(nonIdempotent, nonIdempotentHistory, true); !errors.Is(err, ErrDirtyMigration) {
+		t.Fatalf("planHistory(non-idempotent dirty) error = %v, want ErrDirtyMigration", err)
 	}
 }

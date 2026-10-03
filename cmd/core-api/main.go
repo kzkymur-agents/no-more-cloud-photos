@@ -22,9 +22,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "core-api:", err)
+		bootstrapLogger().Error("core API stopped with an error", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+func bootstrapLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
 func run(ctx context.Context) error {
@@ -54,6 +58,7 @@ func run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	if err := lifecycle.RunHTTP(ctx, server, cfg.ShutdownTimeout, logger); err != nil {
 		return err

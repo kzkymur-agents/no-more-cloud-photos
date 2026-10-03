@@ -35,6 +35,16 @@ pending and `1` for connection failure or migration-history drift.
 forward migrations. Issue #4 owns the initial Core schema, so issue #3 embeds
 no schema SQL and only establishes the runner/history contract.
 
+Migrations are transactional by default and are applied one at a time with
+their history row in the same transaction. A PostgreSQL operation that cannot
+run in a transaction must begin with the exact first line
+`-- nmcp:transaction=off idempotent=true`. The explicit idempotency promise is
+required: the runner writes a dirty/in-progress row before executing outside a
+transaction, and after a process crash reruns only that known, checksum-matched,
+dirty tail migration. Unknown, changed, unsafe, or non-tail dirty history is
+drift and blocks readiness. One session-level advisory lock covers validation,
+transactional migrations, non-transactional execution, and recovery.
+
 ## Environment
 
 | Variable | API | Worker | Admin | Rule/default |

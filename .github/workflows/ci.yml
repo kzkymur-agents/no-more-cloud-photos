@@ -43,6 +43,8 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Build all three Core binaries
+        run: go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
       - name: Unit and local integration tests
         run: go test -count=1 ./...
       - name: Race tests

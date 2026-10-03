@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -34,6 +35,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: nmcp-admin migrate (status|up) [--json]")
 		return exitUsage
 	}
+	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	command := args[1]
 	flags := flag.NewFlagSet("migrate "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -44,44 +46,44 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	cfg, err := config.LoadAdmin()
 	if err != nil {
-		fmt.Fprintln(stderr, "load configuration:", err)
+		logger.Error("load configuration", slog.Any("error", err))
 		return exitFailure
 	}
-	logger, err := logging.NewJSON(stderr, cfg.LogLevel)
+	configuredLogger, err := logging.NewJSON(stderr, cfg.LogLevel)
 	if err != nil {
-		fmt.Fprintln(stderr, "configure logging:", err)
+		logger.Error("configure logging", slog.Any("error", err))
 		return exitFailure
 	}
-	_ = logger
+	logger = configuredLogger
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		fmt.Fprintln(stderr, "configure database pool")
+		logger.Error("configure database pool")
 		return exitFailure
 	}
 	defer pool.Close()
 	migrator, err := database.NewMigrator(pool)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		logger.Error("configure migration runner", slog.Any("error", err))
 		return exitFailure
 	}
 	if command == "up" {
 		if err := migrator.Up(ctx); err != nil {
-			fmt.Fprintln(stderr, "apply migrations:", err)
+			logger.Error("apply migrations", slog.Any("error", err))
 			return exitFailure
 		}
 	}
 	status, err := migrator.Status(ctx)
 	if err != nil {
-		fmt.Fprintln(stderr, "migration status:", err)
+		logger.Error("read migration status", slog.Any("error", err))
 		return exitFailure
 	}
 	if status.Drift {
-		fmt.Fprintln(stderr, "migration history drift:", status.DriftReason)
+		logger.Error("migration history drift", slog.String("reason", status.DriftReason))
 		return exitFailure
 	}
 	if *jsonOutput {
 		if err := json.NewEncoder(stdout).Encode(status); err != nil {
-			fmt.Fprintln(stderr, "write output:", err)
+			logger.Error("write output", slog.Any("error", err))
 			return exitFailure
 		}
 	} else {

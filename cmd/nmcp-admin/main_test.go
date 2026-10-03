@@ -25,6 +25,21 @@ func TestRunRejectsInvalidCommand(t *testing.T) {
 	}
 }
 
+func TestRunOperationalErrorIsStructured(t *testing.T) {
+	t.Setenv("NMCP_DATABASE_URL", "")
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"migrate", "status"}, &stdout, &stderr); code != exitFailure {
+		t.Fatalf("run() code = %d, want %d", code, exitFailure)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(stderr.Bytes(), &record); err != nil {
+		t.Fatalf("stderr is not one JSON log record: %q: %v", stderr.String(), err)
+	}
+	if record["level"] != "ERROR" || record["msg"] != "load configuration" {
+		t.Fatalf("structured log = %#v", record)
+	}
+}
+
 func TestRunMigrationIntegration(t *testing.T) {
 	baseDatabaseURL := os.Getenv("TEST_DATABASE_URL")
 	if baseDatabaseURL == "" {

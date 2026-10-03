@@ -18,9 +18,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "core-worker:", err)
+		bootstrapLogger().Error("core Worker stopped with an error", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+func bootstrapLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
 func run(ctx context.Context) error {

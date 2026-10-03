@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -86,6 +87,150 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("transactional migration rolls back SQL and history together", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrationEntry := testMigration(1, "rollback", `
+			CREATE TABLE should_roll_back (id bigint PRIMARY KEY);
+			INSERT INTO should_roll_back VALUES (1);
+			SELECT 1 / 0;`)
+		migrator := newMigrator(pool, []migration{migrationEntry})
+
+		if err := migrator.Up(context.Background()); err == nil {
+			t.Fatal("Up() expected migration failure")
+		}
+		var tableExists bool
+		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('should_roll_back') IS NOT NULL`).Scan(&tableExists); err != nil {
+			t.Fatalf("check rolled-back table: %v", err)
+		}
+		if tableExists {
+			t.Fatal("failed transactional migration left its table behind")
+		}
+		var historyCount int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM schema_migrations`).Scan(&historyCount); err != nil {
+			t.Fatalf("count migration history: %v", err)
+		}
+		if historyCount != 0 {
+			t.Fatalf("migration history count = %d, want 0", historyCount)
+		}
+	})
+
+	t.Run("transaction-off migration executes outside a transaction", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrations := []migration{
+			testMigration(1, "table", `CREATE TABLE indexed_photos (id bigint PRIMARY KEY)`),
+			testNonTransactionalMigration(2, "index", nonTransactionalDirective+`
+CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`),
+		}
+		migrator := newMigrator(pool, migrations)
+
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("Up() error = %v", err)
+		}
+		var indexExists bool
+		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('indexed_photos_id_idx') IS NOT NULL`).Scan(&indexExists); err != nil {
+			t.Fatalf("check concurrent index: %v", err)
+		}
+		if !indexExists {
+			t.Fatal("transaction-off migration did not create its index")
+		}
+		var dirty bool
+		if err := pool.QueryRow(context.Background(), `SELECT dirty FROM schema_migrations WHERE version = 2`).Scan(&dirty); err != nil {
+			t.Fatalf("read transaction-off history: %v", err)
+		}
+		if dirty {
+			t.Fatal("successful transaction-off migration remained dirty")
+		}
+	})
+
+	t.Run("dirty idempotent transaction-off tail is rerun", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		if err := newMigrator(pool, nil).Up(context.Background()); err != nil {
+			t.Fatalf("initialize history: %v", err)
+		}
+		sql := nonTransactionalDirective + `
+			CREATE TABLE IF NOT EXISTS recovered_values (id bigint PRIMARY KEY);
+			INSERT INTO recovered_values VALUES (1) ON CONFLICT DO NOTHING;`
+		migrationEntry := testNonTransactionalMigration(1, "recover", sql)
+		if _, err := pool.Exec(context.Background(), `CREATE TABLE recovered_values (id bigint PRIMARY KEY); INSERT INTO recovered_values VALUES (1)`); err != nil {
+			t.Fatalf("precreate partial migration result: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO schema_migrations
+				(version, name, checksum, transactional, idempotent, dirty)
+			VALUES ($1, $2, $3, false, true, true)`,
+			migrationEntry.version, migrationEntry.name, migrationEntry.checksum); err != nil {
+			t.Fatalf("precreate dirty history: %v", err)
+		}
+		migrator := newMigrator(pool, []migration{migrationEntry})
+
+		status, err := migrator.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if !status.Drift || status.Ready() || status.CurrentVersion != 0 {
+			t.Fatalf("Status() = %+v, want dirty drift at current version zero", status)
+		}
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("Up() recovery error = %v", err)
+		}
+		var valueCount int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM recovered_values`).Scan(&valueCount); err != nil {
+			t.Fatalf("count recovered values: %v", err)
+		}
+		if valueCount != 1 {
+			t.Fatalf("recovered value count = %d, want 1", valueCount)
+		}
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("transactional dirty history is refused", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrationEntry := testMigration(1, "impossible", "SELECT 1")
+		if err := newMigrator(pool, nil).Up(context.Background()); err != nil {
+			t.Fatalf("initialize history: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO schema_migrations
+				(version, name, checksum, transactional, idempotent, dirty)
+			VALUES ($1, $2, $3, true, false, true)`,
+			migrationEntry.version, migrationEntry.name, migrationEntry.checksum); err != nil {
+			t.Fatalf("precreate dirty history: %v", err)
+		}
+		migrator := newMigrator(pool, []migration{migrationEntry})
+
+		if err := migrator.Up(context.Background()); !errors.Is(err, ErrDirtyMigration) {
+			t.Fatalf("Up() error = %v, want ErrDirtyMigration", err)
+		}
+	})
+
+	t.Run("cancellation still releases session lock", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrator := newMigrator(pool, []migration{testMigration(1, "cancel", "SELECT pg_sleep(10)")})
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		if err := migrator.Up(ctx); err == nil {
+			t.Fatal("Up() expected cancellation error")
+		}
+		conn, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire lock-check connection: %v", err)
+		}
+		defer conn.Release()
+		var locked bool
+		if err := conn.QueryRow(context.Background(), `SELECT pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
+			t.Fatalf("try migration lock: %v", err)
+		}
+		if !locked {
+			t.Fatal("migration session lock remained held after cancellation")
+		}
+		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+			t.Fatalf("release lock-check lock: %v", err)
+		}
+	})
+
 	t.Run("unknown applied version is drift", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
 		migrator, err := NewMigrator(pool)
@@ -96,8 +241,9 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatalf("Up() initialization error = %v", err)
 		}
 		if _, err := pool.Exec(context.Background(), `
-			INSERT INTO schema_migrations (version, name, checksum)
-			VALUES (99, 'future', $1)`, strings.Repeat("0", 64)); err != nil {
+			INSERT INTO schema_migrations
+				(version, name, checksum, transactional, idempotent, dirty)
+			VALUES (99, 'future', $1, true, false, false)`, strings.Repeat("0", 64)); err != nil {
 			t.Fatalf("insert unknown history row: %v", err)
 		}
 
@@ -136,10 +282,38 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatalf("Up() error = %v, want ErrChecksumMismatch", err)
 		}
 	})
+
+	t.Run("invalid history metadata is drift", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrationEntry := testMigration(1, "metadata", "SELECT 1")
+		migrator := newMigrator(pool, []migration{migrationEntry})
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("Up() error = %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE schema_migrations SET name = 'renamed' WHERE version = 1`); err != nil {
+			t.Fatalf("change stored name: %v", err)
+		}
+
+		status, err := migrator.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if !status.Drift || status.Ready() {
+			t.Fatalf("Status() = %+v, want drift and not ready", status)
+		}
+		if err := migrator.Up(context.Background()); !errors.Is(err, ErrInvalidMigrationHistory) {
+			t.Fatalf("Up() error = %v, want ErrInvalidMigrationHistory", err)
+		}
+	})
 }
 
 func testMigration(version int64, name, sql string) migration {
-	return migration{version: version, name: name, checksum: checksumSQL([]byte(sql)), sql: sql}
+	return migration{version: version, name: name, checksum: checksumSQL([]byte(sql)), sql: sql, transactional: true}
+}
+
+func testNonTransactionalMigration(version int64, name, sql string) migration {
+	return migration{version: version, name: name, checksum: checksumSQL([]byte(sql)), sql: sql, idempotent: true}
 }
 
 func integrationPool(t *testing.T, databaseURL string) *pgxpool.Pool {

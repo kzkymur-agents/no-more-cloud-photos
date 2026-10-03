@@ -114,7 +114,7 @@ Targets do not need `running`; the parent lease owns execution. `succeeded` is t
 draft -> active -> retired
 ```
 
-There is at most one active version per key. Activation validates registered processor name, schema version, every exact input MIME, and a recipe/output for every input MIME. Unknown capability cannot activate. Activation retires the old active row atomically and does not regenerate existing media. Existing current rendition remains displayed until a pinned target for a newer version successfully replaces it. Retired versions remain executable for already-pinned targets.
+There is at most one active version per key. Activation validates registered processor name, schema version, every exact input MIME, and a recipe/output for every input MIME. Unknown capability cannot activate. Under a transaction-scoped advisory lock derived from the normalized profile key, activation requires the draft version to be strictly greater than the maximum version with non-null `activated_at` for that key, then retires the old active row and activates the draft atomically. Thus activation versions are monotonic even across retirement; a stale lower-version draft remains draft and cannot become active. Activation does not regenerate existing media. Existing current rendition remains displayed until a pinned target for a newer version successfully replaces it. Retired versions remain executable for already-pinned targets.
 
 ### 5.5 Backup
 
@@ -234,3 +234,7 @@ Chosen so clients cannot construct inconsistent keyset positions or reuse a curs
 ### ADR-011: Keep logically deleted metadata readable until purge
 
 Chosen because restore, progress display, and explicit original access operate on retained data, while default listing still hides deleted Media. Rejected: returning `404` immediately after logical deletion, which falsely implies bytes are gone and prevents a coherent restore UI. The trust boundary remains Tailnet-wide; purge is the operation that removes bytes and metadata.
+
+### ADR-012: Make profile activation versions monotonic per key
+
+Chosen so numeric version ordering is also activation-generation ordering, allowing publication to reject a delayed older target without a second generation identifier. A key-scoped advisory lock makes concurrent activation decisions deterministic. Rejected: allowing an already superseded lower version to become active, which can never safely replace a newer current rendition, and a separate activation-generation column, which adds another ordering identity without a use case for version rollback. Rollback is performed by creating a new higher version with the desired older recipe, preserving audit history.

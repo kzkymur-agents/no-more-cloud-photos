@@ -140,23 +140,39 @@ func (m *Migrator) Up(ctx context.Context) (returnErr error) {
 	}
 	locked := false
 	defer func() {
-		if locked {
-			unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			defer cancel()
-			var unlocked bool
-			if err := conn.QueryRow(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationLockKey).Scan(&unlocked); err != nil {
-				returnErr = errors.Join(returnErr, fmt.Errorf("release migration advisory lock: %w", err))
-			} else if !unlocked {
-				returnErr = errors.Join(returnErr, errors.New("release migration advisory lock: lock was not held"))
-			}
+		if !locked {
+			conn.Release()
+			return
 		}
-		conn.Release()
+
+		unlockCtx, cancelUnlock := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		// Advisory locks are reentrant. A single successful unlock is not proof
+		// that migration SQL did not increment the same lock count. This
+		// connection is dedicated to Up, so clear every session lock before it can
+		// be returned to the pool.
+		_, unlockErr := conn.Exec(unlockCtx, `SELECT pg_catalog.pg_advisory_unlock_all()`)
+		cancelUnlock()
+		if unlockErr == nil {
+			conn.Release()
+			return
+		}
+		returnErr = errors.Join(returnErr, fmt.Errorf("release migration advisory locks: %w", unlockErr))
+
+		physicalConn := conn.Hijack()
+		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancelClose()
+		if err := physicalConn.Close(closeCtx); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("discard migration connection: %w", err))
+		}
 	}()
 
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+	// Once acquisition is attempted, its server-side outcome is uncertain on a
+	// context/network error. The defer must therefore confirm unlock or discard
+	// the physical session instead of ever returning it to the pool unchecked.
+	locked = true
+	if _, err := conn.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, migrationLockKey); err != nil {
 		return fmt.Errorf("acquire migration advisory lock: %w", err)
 	}
-	locked = true
 
 	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -370,6 +386,21 @@ func discoverMigrations(fsys fs.FS, directory string) ([]migration, error) {
 		transactional, idempotent, err := parseMigrationDirective(contents)
 		if err != nil {
 			return nil, fmt.Errorf("migration %q: %w", entry.Name(), err)
+		}
+		statements, err := scanSQLStatements(contents)
+		if err != nil {
+			return nil, fmt.Errorf("migration %q: invalid SQL: %w", entry.Name(), err)
+		}
+		if len(statements) == 0 {
+			return nil, fmt.Errorf("migration %q: migration must contain at least one executable statement", entry.Name())
+		}
+		for _, statement := range statements {
+			if isTransactionControl(statement) {
+				return nil, fmt.Errorf("migration %q: explicit transaction control is not allowed", entry.Name())
+			}
+		}
+		if !transactional && len(statements) != 1 {
+			return nil, fmt.Errorf("migration %q: transaction-off migration must contain exactly one statement", entry.Name())
 		}
 		versions[version] = entry.Name()
 		migrations = append(migrations, migration{

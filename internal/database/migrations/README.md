@@ -17,8 +17,10 @@ forbids in a transaction must use this exact first line:
 -- nmcp:transaction=off idempotent=true
 ```
 
-Such a migration must be safe to rerun after any partial execution. The
-migrator rejects transaction-off files without that explicit idempotence marker.
+Such a migration must contain exactly one executable statement and be safe to
+rerun after an interrupted attempt. The migrator rejects explicit transaction
+control in every migration and rejects transaction-off files without that
+explicit idempotence marker.
 
 Issue #4 owns the initial schema, so this directory intentionally contains no SQL
 migrations yet.

@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -116,10 +118,14 @@ func TestMigratorIntegration(t *testing.T) {
 
 	t.Run("transaction-off migration executes outside a transaction", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
-		migrations := []migration{
-			testMigration(1, "table", `CREATE TABLE indexed_photos (id bigint PRIMARY KEY)`),
-			testNonTransactionalMigration(2, "index", nonTransactionalDirective+`
-CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`),
+		fsys := fstest.MapFS{
+			"migrations/1_table.sql": {Data: []byte(`CREATE TABLE indexed_photos (id bigint PRIMARY KEY)`)},
+			"migrations/2_index.sql": {Data: []byte(nonTransactionalDirective + `
+CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
+		}
+		migrations, err := discoverMigrations(fsys, "migrations")
+		if err != nil {
+			t.Fatalf("discoverMigrations() error = %v", err)
 		}
 		migrator := newMigrator(pool, migrations)
 
@@ -142,15 +148,47 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`),
 		}
 	})
 
+	t.Run("unsafe migration files are rejected before execution", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		tests := []struct {
+			name string
+			sql  string
+		}{
+			{name: "transaction control", sql: "CREATE TABLE rejected_control (id bigint); COMMIT"},
+			{name: "transaction-off multiple statements", sql: nonTransactionalDirective + "\nCREATE TABLE rejected_multiple (id bigint); SELECT 1"},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				fsys := fstest.MapFS{"migrations/1_rejected.sql": {Data: []byte(test.sql)}}
+				if _, err := discoverMigrations(fsys, "migrations"); err == nil {
+					t.Fatal("discoverMigrations() expected an error")
+				}
+			})
+		}
+
+		for _, table := range []string{"rejected_control", "rejected_multiple"} {
+			var exists bool
+			if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+				t.Fatalf("check rejected migration side effect: %v", err)
+			}
+			if exists {
+				t.Fatalf("rejected migration created table %q", table)
+			}
+		}
+	})
+
 	t.Run("dirty idempotent transaction-off tail is rerun", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
 		if err := newMigrator(pool, nil).Up(context.Background()); err != nil {
 			t.Fatalf("initialize history: %v", err)
 		}
-		sql := nonTransactionalDirective + `
-			CREATE TABLE IF NOT EXISTS recovered_values (id bigint PRIMARY KEY);
-			INSERT INTO recovered_values VALUES (1) ON CONFLICT DO NOTHING;`
-		migrationEntry := testNonTransactionalMigration(1, "recover", sql)
+		fsys := fstest.MapFS{"migrations/1_recover.sql": {Data: []byte(nonTransactionalDirective + `
+			INSERT INTO recovered_values VALUES (1) ON CONFLICT DO NOTHING;`)}}
+		migrations, err := discoverMigrations(fsys, "migrations")
+		if err != nil {
+			t.Fatalf("discoverMigrations() error = %v", err)
+		}
+		migrationEntry := migrations[0]
 		if _, err := pool.Exec(context.Background(), `CREATE TABLE recovered_values (id bigint PRIMARY KEY); INSERT INTO recovered_values VALUES (1)`); err != nil {
 			t.Fatalf("precreate partial migration result: %v", err)
 		}
@@ -161,7 +199,7 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`),
 			migrationEntry.version, migrationEntry.name, migrationEntry.checksum); err != nil {
 			t.Fatalf("precreate dirty history: %v", err)
 		}
-		migrator := newMigrator(pool, []migration{migrationEntry})
+		migrator := newMigrator(pool, migrations)
 
 		status, err := migrator.Status(context.Background())
 		if err != nil {
@@ -220,14 +258,60 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`),
 		}
 		defer conn.Release()
 		var locked bool
-		if err := conn.QueryRow(context.Background(), `SELECT pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
+		if err := conn.QueryRow(context.Background(), `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
 			t.Fatalf("try migration lock: %v", err)
 		}
 		if !locked {
 			t.Fatal("migration session lock remained held after cancellation")
 		}
-		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+		if _, err := conn.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
 			t.Fatalf("release lock-check lock: %v", err)
+		}
+	})
+
+	t.Run("reentrant advisory lock is fully released", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		sql := fmt.Sprintf("SELECT pg_catalog.pg_advisory_lock(%d)", migrationLockKey)
+		migrator := newMigrator(pool, []migration{testMigration(1, "reentrant_lock", sql)})
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("Up() error = %v", err)
+		}
+
+		first, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire first connection: %v", err)
+		}
+		defer first.Release()
+		second, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire independent lock-check connection: %v", err)
+		}
+		defer second.Release()
+		var acquired bool
+		if err := second.QueryRow(context.Background(), `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&acquired); err != nil {
+			t.Fatalf("try advisory lock from independent session: %v", err)
+		}
+		if !acquired {
+			t.Fatal("reentrant migration lock remained held after Up")
+		}
+		if _, err := second.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock_all()`); err != nil {
+			t.Fatalf("release independent lock: %v", err)
+		}
+	})
+
+	t.Run("failed advisory unlock discards the physical connection", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		migrator := newMigrator(pool, []migration{testMigration(1, "terminate", `SELECT pg_terminate_backend(pg_backend_pid())`)})
+		if err := migrator.Up(context.Background()); err == nil || !strings.Contains(err.Error(), "release migration advisory locks") {
+			t.Fatalf("Up() error = %v, want advisory unlock failure", err)
+		}
+		if total := pool.Stat().TotalConns(); total != 0 {
+			t.Fatalf("pool total connections after discard = %d, want 0", total)
+		}
+
+		var replacementBackend int
+		if err := pool.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&replacementBackend); err != nil {
+			t.Fatalf("use pool after connection discard: %v", err)
 		}
 	})
 

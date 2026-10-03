@@ -39,8 +39,12 @@ Migrations are transactional by default and are applied one at a time with
 their history row in the same transaction. A PostgreSQL operation that cannot
 run in a transaction must begin with the exact first line
 `-- nmcp:transaction=off idempotent=true`. The explicit idempotency promise is
-required: the runner writes a dirty/in-progress row before executing outside a
-transaction, and after a process crash reruns only that known, checksum-matched,
+required, and such a file contains exactly one executable statement so the
+PostgreSQL simple-query protocol cannot create an implicit multi-statement
+transaction. Every migration rejects explicit transaction-control statements;
+only the runner owns transaction boundaries. The runner writes a
+dirty/in-progress row before executing outside a transaction, and after a
+process crash reruns only that known, checksum-matched,
 dirty tail migration. Unknown, changed, unsafe, or non-tail dirty history is
 drift and blocks readiness. One session-level advisory lock covers validation,
 transactional migrations, non-transactional execution, and recovery.

@@ -10,7 +10,7 @@ An upload is accepted only after the durable original, Media/Original rows, idem
 
 ## 2. Conceptual persistent model
 
-All IDs are UUIDv4. Migrations are forward-only, transactional where PostgreSQL permits, versioned, and protected by a migration advisory lock. Rollback means restore a tested backup or deploy a forward repair migration; destructive down migrations are not shipped.
+All IDs are UUIDv4. Migrations are forward-only, embedded in the administrative binary with immutable version/checksum history, transactional where PostgreSQL permits, versioned, and protected by a migration advisory lock. `nmcp-admin migrate status` is read-only and `nmcp-admin migrate up` is the only deployment mutation entry point; API and Worker refuse readiness when migrations are pending or checksums drift. Rollback means restore a tested backup or deploy a forward repair migration; destructive down migrations are not shipped.
 
 ### 2.1 Core entities
 

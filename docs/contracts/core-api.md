@@ -321,6 +321,8 @@ The binary is `nmcp-admin` using Go `flag`. All commands accept `--json`; human-
 
 | Command | Contract |
 |---|---|
+| `migrate status [--json]` | Compare embedded migration checksums and versions with the database without changing it. Exit `4` when pending migrations exist and `1` on checksum drift or an unreachable database. |
+| `migrate up [--json]` | Under the migration advisory lock, apply every pending embedded forward migration in version order. Refuse checksum drift, unknown applied versions, or downgrade. This non-interactive command is the deployment migration entry point. |
 | `config show [--json]` | Show typed non-secret system configuration. |
 | `config set --name NAME --value VALUE [--json]` | Set one of `deleted_media_retention_days`, `superseded_rendition_retention_days`, `default_timezone`, `db_backup_interval_hours`, `db_backup_retention_days`; literal `null` is allowed only for the two retention values. Validate before transaction. |
 | `profile create --file FILE [--json]` | Create immutable draft profile from JSON; validate processor/schema/MIME recipes. |
